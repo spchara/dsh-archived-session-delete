@@ -1,25 +1,26 @@
 /**
  * Host half of archived-session-delete: one route,
- * `POST /archived-session-delete/purge`, that removes ARCHIVED Sessions for
- * good — one Session, or a batch of them.
+ * `POST /archived-session-delete/purge`, that removes Conversations for good —
+ * one Session, or a batch of them. An archived Session and a plain one are
+ * deleted the same way; the only difference is that the archived one also has
+ * a record in the archive set to clear.
  *
  * The order of operations is deliberate, and applies per Session. The log
  * directory is removed first: that is the step that can fail for an external
  * reason (a Windows sharing violation, a permission refusal), and failing it
- * must leave the archive set untouched so the row still shows and the user can
- * retry. Only after the log is gone are the registry records cleaned up — the
- * archive set, the pin, and every Workspace account that still lists the
+ * must leave the registry records untouched so the row still shows and the
+ * user can retry. Only after the log is gone are those records cleaned up —
+ * the archive set, the pin, and every Workspace account that still lists the
  * Session — with each cleanup step reported as a warning instead of discarding
  * a deletion that already happened.
  *
- * A batch answers `200` with one entry per Session: one that is no longer
- * archived, or still live, is that entry's refusal and never stops the rest of
- * the batch.
+ * A batch answers `200` with one entry per Session: one that is unknown, or
+ * still live, is that entry's refusal and never stops the rest of the batch.
  *
  * Guards: the trust fence (`connection.requestRejection`) answers before
  * anything else, the caller must use POST with an `application/json` body, and
- * every named Session must be archived (that is the surface this plugin
- * serves) and not live (a live Session owns a write handle).
+ * every named Session must be identifiable (a stored log, or an archive record)
+ * and not live (a live Session owns a write handle).
  *
  * @module archived-session-delete
  */
@@ -159,7 +160,14 @@ function requestedIds(payload) {
 }
 
 /**
- * Delete one archived Session.
+ * Delete one Session, archived or not.
+ *
+ * Existence is decided by the backend, not by the archive set: a Session is
+ * deletable when session persistence holds a log for it, or when the archive
+ * set still names it (an archived Session may be record-only). An id that is
+ * neither is a typo or a stale reference, and is refused instead of being
+ * reported as deleted.
+ *
  * @param services - the services resolved for this request.
  * @param sessionId - the Session to remove.
  * @returns one result entry; a refusal is data, not a thrown error.
@@ -167,17 +175,18 @@ function requestedIds(payload) {
 async function purgeOne({ ctx, registry, persistence, sessions }, sessionId) {
   const refuse = (code, message) => ({ sessionId, ok: false, code, message })
 
-  if (!registry.archivedSessionIds.includes(sessionId)) {
-    return refuse('session-not-archived', `session '${sessionId}' is not archived, so this surface does not delete it`)
-  }
   if (sessions !== undefined && sessions.get(sessionId) !== undefined) {
     return refuse('session-live', `session '${sessionId}' is live in this process; close it before deleting it`)
   }
+  const archived = registry.archivedSessionIds.includes(sessionId)
 
   // Step 1: the stored log directory. Failing here changes nothing else.
   let logDir = null
   try {
     const snapshot = await persistence.stat(sessionId)
+    if (snapshot === undefined && !archived) {
+      return refuse('session-not-found', `session '${sessionId}' has no stored log and is not archived`)
+    }
     const path = snapshot?.location?.path
     if (typeof path === 'string' && path.length > 0) {
       logDir = dirname(path)

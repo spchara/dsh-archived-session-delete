@@ -112,13 +112,17 @@ try {
   console.log(`module: ${name}, inject: ${inject.join(',')}`)
 
   const logs = new Map()
-  for (const id of ['s-one', 's-two', 's-live', 's-locked']) logs.set(id, await makeLog(root, id))
+  for (const id of ['s-one', 's-two', 's-plain', 's-live']) logs.set(id, await makeLog(root, id))
+  // A backend answer that is not a session directory: this id's "log path"
+  // hangs off a regular file, so the directory precheck must refuse it.
+  const notADir = join(root, 'proj', 's-bad')
+  await writeFile(notADir, 'not a directory\n', 'utf8')
 
-  const archived = new Set(['s-one', 's-two', 's-live', 's-locked'])
+  const archived = new Set(['s-one', 's-two', 's-live', 's-bad'])
   const pinned = new Set(['s-one', 's-two'])
   const detached = []
   const workspaces = [
-    { id: 'ws-one', sessionIds: ['s-one', 's-two'], async detachSession(id) { detached.push(id) } },
+    { id: 'ws-one', sessionIds: ['s-one', 's-two', 's-plain'], async detachSession(id) { detached.push(id) } },
     { id: 'ws-two', sessionIds: ['s-two'], async detachSession(id) { detached.push(`two:${id}`) } },
   ]
   const registry = {
@@ -129,9 +133,12 @@ try {
   }
   const persistence = {
     async stat(id) {
-      if (id === 's-locked') return { location: { kind: 'jsonl', path: join(logs.get(id).file, 'not-a-dir', 'session.jsonl') } }
+      if (id === 's-bad') return { location: { kind: 'jsonl', path: join(notADir, 'session.jsonl') } }
       const entry = logs.get(id)
-      return entry === undefined ? undefined : { location: { kind: 'jsonl', path: entry.file } }
+      if (entry === undefined) return undefined
+      // The real backend re-reads the file, so a deleted log is no longer found.
+      if (await gone(entry.dir)) return undefined
+      return { location: { kind: 'jsonl', path: entry.file } }
     },
   }
   const sessions = { get(id) { return id === 's-live' ? {} : undefined } }
@@ -159,9 +166,9 @@ try {
 
   // ---- per-Session refusals (data, not HTTP failures) ----------------------
   res = await call(routes, { method: 'POST', contentType: 'application/json', body: '{"sessionIds":["s-other"]}' })
-  check('unarchived session reports session-not-archived', res.statusCode === 200
+  check('unknown id reports session-not-found', res.statusCode === 200
     && res.json().results[0].ok === false
-    && res.json().results[0].code === 'session-not-archived', res.body)
+    && res.json().results[0].code === 'session-not-found', res.body)
 
   res = await call(routes, { method: 'POST', contentType: 'application/json', body: '{"sessionIds":["s-live"]}' })
   check('live session reports session-live', res.statusCode === 200
@@ -180,7 +187,15 @@ try {
 
   res = await call(routes, { method: 'POST', contentType: 'application/json', body: '{"sessionIds":["s-one"]}' })
   check('repeating the deletion is refused, not repeated', res.statusCode === 200
-    && res.json().results[0].code === 'session-not-archived', res.body)
+    && res.json().results[0].code === 'session-not-found', res.body)
+
+  // ---- a Session that was never archived deletes just the same -------------
+  detached.length = 0
+  res = await call(routes, { method: 'POST', contentType: 'application/json', body: '{"sessionIds":["s-plain"]}' })
+  const plain = res.json().results[0]
+  check('unarchived Session is deleted', res.statusCode === 200 && plain.ok === true, res.body)
+  check('unarchived Session loses its log too', await gone(logs.get('s-plain').dir))
+  check('unarchived Session is detached from its workspace', detached.includes('s-plain'))
 
   // ---- a batch keeps going past a refusal ----------------------------------
   detached.length = 0
@@ -192,16 +207,16 @@ try {
   const batch = res.json().results
   check('batch answers one entry per distinct id', batch.length === 2, JSON.stringify(batch))
   check('batch deletes the archived Session', batch[0].sessionId === 's-two' && batch[0].ok === true)
-  check('batch continues past a refused Session', batch[1].code === 'session-not-archived')
+  check('batch continues past a refused Session', batch[1].code === 'session-not-found')
   check('batch removes that log too', await gone(logs.get('s-two').dir))
   check('batch detaches from every accounting workspace', detached.includes('s-two') && detached.includes('two:s-two'))
 
-  // ---- a failed filesystem removal changes nothing -------------------------
-  res = await call(routes, { method: 'POST', contentType: 'application/json', body: '{"sessionIds":["s-locked"]}' })
-  check('a failing removal reports delete-failed', res.statusCode === 200
+  // ---- a refused path changes nothing --------------------------------------
+  res = await call(routes, { method: 'POST', contentType: 'application/json', body: '{"sessionIds":["s-bad"]}' })
+  check('a non-directory log path reports delete-failed', res.statusCode === 200
     && res.json().results[0].code === 'delete-failed', res.body)
-  check('a failing removal keeps the archive record', archived.has('s-locked'))
-  check('a failing removal keeps the log on disk', !(await gone(logs.get('s-locked').dir)))
+  check('a refused deletion keeps the archive record', archived.has('s-bad'))
+  check('a refused deletion leaves that path alone', !(await gone(notADir)))
 } finally {
   await rm(root, { recursive: true, force: true })
 }

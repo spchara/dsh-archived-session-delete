@@ -18,13 +18,13 @@ window.__ModuleLoader__.load({
     /** Dictionaries for the visible copy; the locale service holds them per namespace. */
     const DICTIONARIES = {
       en: {
-        'menu.delete': 'Delete archived conversation',
+        'menu.delete': 'Delete conversation',
         'menu.batch': 'Delete archived conversations…',
         'menu.restoreConfirm': 'Ask before deleting again',
         'actions.delete': 'Delete this archived conversation permanently',
         'actions.deleteDirect': 'Delete permanently (no confirmation today)',
         'confirm.title': 'Delete this conversation permanently?',
-        'confirm.desc': '“{title}” is removed from disk: its session log, its archive record, and its workspace entry are all deleted. This cannot be undone.',
+        'confirm.desc': '“{title}” is removed from disk: its session log, archive and workspace records are all cleared, and this cannot be undone.',
         'confirm.untitled': 'Untitled conversation',
         'confirm.rememberToday': 'Do not ask me again today',
         'confirm.pending': 'Deleting…',
@@ -44,17 +44,20 @@ window.__ModuleLoader__.load({
         'notice.failed': 'Delete failed: {detail}',
         'notice.confirmOff': 'Delete confirmation is off for today.',
         'notice.confirmOn': 'Delete confirmation is back on.',
+        'error.sessionLive': 'This conversation is open right now; switch to another one first.',
+        'error.sessionNotFound': 'That conversation no longer exists (already deleted?).',
+        'error.deleteFailed': 'The stored log could not be removed.',
         'cancel': 'Cancel',
         'close': 'Close',
       },
       zh: {
-        'menu.delete': '彻底删除此会话',
+        'menu.delete': '删除此会话',
         'menu.batch': '批量删除归档会话…',
         'menu.restoreConfirm': '恢复删除前的确认',
         'actions.delete': '彻底删除此归档会话',
         'actions.deleteDirect': '彻底删除（今天不再确认）',
         'confirm.title': '彻底删除这个会话？',
-        'confirm.desc': '「{title}」将从磁盘删除：会话日志、归档记录与工作区归属一并清除，且无法恢复。',
+        'confirm.desc': '「{title}」将从磁盘删除：会话日志、归档与工作区记录一并清除，且无法恢复。',
         'confirm.untitled': '未命名会话',
         'confirm.rememberToday': '今天不再提醒我',
         'confirm.pending': '正在删除…',
@@ -74,6 +77,9 @@ window.__ModuleLoader__.load({
         'notice.failed': '删除失败：{detail}',
         'notice.confirmOff': '今天不再弹出删除确认。',
         'notice.confirmOn': '已恢复删除前的确认。',
+        'error.sessionLive': '这个会话当前是打开状态，先切换到别的会话再删。',
+        'error.sessionNotFound': '这个会话已经不在了（可能已被删除）。',
+        'error.deleteFailed': '会话日志删不掉。',
         'cancel': '取消',
         'close': '关闭',
       },
@@ -327,11 +333,32 @@ window.__ModuleLoader__.load({
       return results
     }
 
+    /** Host refusal codes with their own copy; anything else shows the Host's message. */
+    const FAILURE_KEYS = {
+      'session-live': 'error.sessionLive',
+      'session-not-found': 'error.sessionNotFound',
+      'delete-failed': 'error.deleteFailed',
+    }
+
+    /**
+     * Human text for one refused result entry.
+     * @param entry - the Host's `{ code, message }` for one Session.
+     * @returns localized copy for a known code, otherwise the Host's own message.
+     */
+    function describeFailure(entry) {
+      const code = typeof entry?.code === 'string' ? entry.code : ''
+      const key = FAILURE_KEYS[code]
+      if (key !== undefined) return translate(key)
+      const message = typeof entry?.message === 'string' ? entry.message : ''
+      return message === '' ? code : message
+    }
+
     /**
      * Delete the named Sessions and report the outcome as one notice.
      * @param sessionIds - the Sessions to remove.
+     * @param labels - display titles by Session id, so a refusal names the row.
      */
-    async function runDelete(sessionIds) {
+    async function runDelete(sessionIds, labels = {}) {
       if (sessionIds.length === 0) return
       showNotice('busy', translate('notice.deleting'))
       let results
@@ -348,7 +375,11 @@ window.__ModuleLoader__.load({
         return
       }
       const detail = failed
-        .map(entry => `${typeof entry.sessionId === 'string' ? entry.sessionId : '?'}: ${String(entry.message ?? entry.code ?? '')}`)
+        .map((entry) => {
+          const id = typeof entry.sessionId === 'string' ? entry.sessionId : '?'
+          const label = typeof labels[id] === 'string' && labels[id] !== '' ? labels[id] : id
+          return `${label}: ${describeFailure(entry)}`
+        })
         .join('; ')
       if (ok === 0) {
         showNotice('error', translate('notice.failed', { detail }))
@@ -379,14 +410,25 @@ window.__ModuleLoader__.load({
         && snapshot.archivedSessionIds.includes(sessionId))
     }
 
-    /** Menu row (order 500): delete this archived Session. */
+    /**
+     * One-entry label map for a notice built outside render.
+     * @param sessionId - the Session the label belongs to.
+     * @param displayTitle - its row title, possibly empty.
+     * @returns a map the notice can name the Session with.
+     */
+    function labelMap(sessionId, displayTitle) {
+      return typeof displayTitle === 'string' && displayTitle !== '' ? { [sessionId]: displayTitle } : {}
+    }
+
+    /**
+     * Menu row (order 500): delete this Session, archived or not. Every row
+     * offers it — the archive set only decides whether a record other than the
+     * log has to be cleared.
+     */
     function ArchiveDeleteMenuItem(props) {
-      const { sessionId, displayTitle, useWorkspaces, useMenuOpenState, t } = props
+      const { sessionId, displayTitle, useMenuOpenState, t } = props
       const view = useView()
-      if (typeof useWorkspaces !== 'function') return null
-      const archived = useArchivedRow(useWorkspaces, sessionId)
       const [, setMenuOpen] = useMenuOpenState()
-      if (!archived) return null
       void view.revision
       ensureStyles()
       const direct = skipConfirmActive()
@@ -398,7 +440,7 @@ window.__ModuleLoader__.load({
           className: `${KEY}-item ${KEY}-danger`,
           onClick: () => {
             setMenuOpen(false)
-            if (direct) void runDelete([sessionId])
+            if (direct) void runDelete([sessionId], labelMap(sessionId, displayTitle))
             else setPanel({ kind: 'confirm', sessionId, displayTitle })
           },
         },
@@ -410,12 +452,10 @@ window.__ModuleLoader__.load({
 
     /** Menu row (order 505): bring the confirmation back while it is suppressed. */
     function ArchiveRestoreConfirmMenuItem(props) {
-      const { sessionId, useWorkspaces, useMenuOpenState, t } = props
+      const { useMenuOpenState, t } = props
       const view = useView()
-      if (typeof useWorkspaces !== 'function') return null
-      const archived = useArchivedRow(useWorkspaces, sessionId)
       const [, setMenuOpen] = useMenuOpenState()
-      if (!archived || !skipConfirmActive()) return null
+      if (!skipConfirmActive()) return null
       void view.revision
       ensureStyles()
       return h('button', {
@@ -475,7 +515,7 @@ window.__ModuleLoader__.load({
         'aria-label': label,
         title: label,
         onClick: () => {
-          if (direct) void runDelete([sessionId])
+          if (direct) void runDelete([sessionId], labelMap(sessionId, displayTitle))
           else setPanel({ kind: 'confirm', sessionId, displayTitle })
         },
       }, h(TrashIcon))
@@ -548,7 +588,7 @@ window.__ModuleLoader__.load({
         if (remember) rememberToday()
         setBusy(true)
         setPanel(null)
-        void runDelete([request.sessionId])
+        void runDelete([request.sessionId], labelMap(request.sessionId, request.displayTitle))
       }
       const shown = typeof request.displayTitle === 'string' && request.displayTitle !== ''
         ? request.displayTitle
@@ -603,7 +643,9 @@ window.__ModuleLoader__.load({
         if (remember) rememberToday()
         setBusy(true)
         setPanel(null)
-        void runDelete(selected)
+        const labels = {}
+        for (const id of selected) labels[id] = titleOf(id)
+        void runDelete(selected, labels)
       }
       const titleOf = (id) => {
         const row = byId === undefined ? undefined : byId[id]

@@ -4,7 +4,7 @@
     "description": "Adds a delete key to archived conversations in the sidebar: one at a time or in a batch, with an optional \"do not ask again today\" switch that removes the session logs from disk."
   },
   "menu": {
-    "delete": "Delete archived conversation",
+    "delete": "Delete conversation",
     "batch": "Delete archived conversations…",
     "restoreConfirm": "Ask before deleting again"
   },
