@@ -1,0 +1,21 @@
+{
+  "meta": {
+    "title": "Delete archived conversation",
+    "description": "Adds a delete key to archived conversations in the sidebar and removes the session log from disk."
+  },
+  "menu": {
+    "delete": "Delete archived conversation"
+  },
+  "actions": {
+    "delete": "Delete this archived conversation permanently"
+  },
+  "confirm": {
+    "title": "Delete this conversation permanently?",
+    "desc": "“{title}” is removed from disk: its session log, its archive record, and its workspace entry are all deleted. This cannot be undone.",
+    "untitled": "Untitled conversation",
+    "pending": "Deleting…",
+    "action": "Delete permanently"
+  },
+  "cancel": "Cancel",
+  "close": "Close"
+}

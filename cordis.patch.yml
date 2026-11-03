@@ -1,0 +1,6 @@
+# archived-session-delete: one Host route plus one Client bundle entry.
+# The Host half owns the destructive filesystem step; the Client half only
+# contributes the sidebar entries, so both sides come from this one package.
+- insert:
+    - id: archived-session-delete
+      name: '@local/archived-session-delete'
