@@ -2,9 +2,9 @@
  * Host-half check for @local/archived-session-delete.
  *
  * Drives the registered route handler with fake request/response objects and a
- * fake registry over a REAL temporary session directory, so the deletion
- * semantics (log directory removed, registry cleaned up, guards refused) are
- * exercised without the running profile or a browser.
+ * fake registry over REAL temporary session directories, so the deletion
+ * semantics (log directory removed, registry cleaned up, per-Session refusals,
+ * batch isolation) are exercised without the running profile or a browser.
  *
  * Run: node test/host.route.mjs
  */
@@ -30,7 +30,6 @@ function makeRequest(method, contentType, body) {
   return {
     method,
     headers: contentType === null ? {} : { 'content-type': contentType },
-    destroyed: false,
     async *[Symbol.asyncIterator]() {
       yield bytes
     },
@@ -89,103 +88,120 @@ async function call(routes, options) {
   return res
 }
 
+/** One archived Session's log layout under the temporary root. */
+async function makeLog(root, id) {
+  const dir = join(root, 'proj', id)
+  const file = join(dir, 'session.4.jsonl')
+  await mkdir(dir, { recursive: true })
+  await writeFile(file, '{"type":"turn/start"}\n', 'utf8')
+  return { dir, file }
+}
+
+/** Whether a path is gone. */
+async function gone(path) {
+  try {
+    await stat(path)
+    return false
+  } catch {
+    return true
+  }
+}
+
 const root = await mkdtemp(join(tmpdir(), 'asd-host-check-'))
 try {
   console.log(`module: ${name}, inject: ${inject.join(',')}`)
 
-  // A real stored-log layout: <root>/<project>/<session>/<log file>
-  const logDir = join(root, 'proj', 's-temp')
-  const logFile = join(logDir, 'session.4.jsonl')
-  await mkdir(logDir, { recursive: true })
-  await writeFile(logFile, '{"type":"session/start"}\n', 'utf8')
+  const logs = new Map()
+  for (const id of ['s-one', 's-two', 's-live', 's-locked']) logs.set(id, await makeLog(root, id))
 
-  const archived = new Set(['s-temp', 's-live'])
-  const pinned = new Set(['s-temp'])
+  const archived = new Set(['s-one', 's-two', 's-live', 's-locked'])
+  const pinned = new Set(['s-one', 's-two'])
   const detached = []
-  const workspace = {
-    id: 'ws-one',
-    sessionIds: ['s-temp'],
-    async detachSession(id) { detached.push(id) },
-  }
+  const workspaces = [
+    { id: 'ws-one', sessionIds: ['s-one', 's-two'], async detachSession(id) { detached.push(id) } },
+    { id: 'ws-two', sessionIds: ['s-two'], async detachSession(id) { detached.push(`two:${id}`) } },
+  ]
   const registry = {
     get archivedSessionIds() { return [...archived] },
     async unarchiveSession(id) { archived.delete(id) },
     async unpinSession(id) { pinned.delete(id) },
-    list() { return [workspace] },
+    list() { return workspaces },
   }
   const persistence = {
     async stat(id) {
-      if (id === 's-temp') return { location: { kind: 'jsonl', path: logFile } }
-      return undefined
+      if (id === 's-locked') return { location: { kind: 'jsonl', path: join(logs.get(id).file, 'not-a-dir', 'session.jsonl') } }
+      const entry = logs.get(id)
+      return entry === undefined ? undefined : { location: { kind: 'jsonl', path: entry.file } }
     },
   }
   const sessions = { get(id) { return id === 's-live' ? {} : undefined } }
 
   const routes = new Map()
-  const ctx = makeContext({ workspaceRegistry: registry, sessionPersistence: persistence, sessions }, routes)
-  apply(ctx)
+  apply(makeContext({ workspaceRegistry: registry, sessionPersistence: persistence, sessions }, routes))
   check('route registered at the documented path', routes.has('/archived-session-delete/purge'))
 
-  // 405 for a non-POST method.
+  // ---- envelope guards -----------------------------------------------------
   let res = await call(routes, { method: 'GET', contentType: 'application/json', body: '' })
   check('GET is refused with 405', res.statusCode === 405, `status ${res.statusCode}`)
 
-  // 415 for a non-JSON media type.
   res = await call(routes, { method: 'POST', contentType: 'text/plain', body: '{}' })
   check('non-JSON body is refused with 415', res.statusCode === 415, `status ${res.statusCode}`)
 
-  // 400 for a missing / malformed sessionId.
-  res = await call(routes, { method: 'POST', contentType: 'application/json', body: '{"sessionId":"../etc"}' })
+  res = await call(routes, { method: 'POST', contentType: 'application/json', body: '{"sessionIds":["../etc"]}' })
   check('path-like session id is refused with 400', res.statusCode === 400, `status ${res.statusCode}`)
 
-  // 409 for a session outside the archive set.
-  res = await call(routes, { method: 'POST', contentType: 'application/json', body: '{"sessionId":"s-other"}' })
-  check('unarchived session is refused with 409', res.statusCode === 409 && res.json().code === 'session-not-archived')
+  res = await call(routes, { method: 'POST', contentType: 'application/json', body: '{"sessionIds":[]}' })
+  check('empty id list is refused with 400', res.statusCode === 400, `status ${res.statusCode}`)
 
-  // 409 for a live session.
-  res = await call(routes, { method: 'POST', contentType: 'application/json', body: '{"sessionId":"s-live"}' })
-  check('live session is refused with 409', res.statusCode === 409 && res.json().code === 'session-live')
+  const tooMany = JSON.stringify({ sessionIds: Array.from({ length: 201 }, (_, index) => `s-${String(index)}`) })
+  res = await call(routes, { method: 'POST', contentType: 'application/json', body: tooMany })
+  check('over-long batch is refused with 400', res.statusCode === 400, `status ${res.statusCode}`)
 
-  // The real deletion.
-  res = await call(routes, { method: 'POST', contentType: 'application/json', body: '{"sessionId":"s-temp"}' })
-  const payload = res.json()
-  check('deletion answers 200', res.statusCode === 200, `status ${res.statusCode} ${res.body}`)
-  check('deletion reports the removed directory', payload.logDir === logDir, String(payload.logDir))
-  check('no warnings on the happy path', Array.isArray(payload.warnings) && payload.warnings.length === 0)
+  // ---- per-Session refusals (data, not HTTP failures) ----------------------
+  res = await call(routes, { method: 'POST', contentType: 'application/json', body: '{"sessionIds":["s-other"]}' })
+  check('unarchived session reports session-not-archived', res.statusCode === 200
+    && res.json().results[0].ok === false
+    && res.json().results[0].code === 'session-not-archived', res.body)
 
-  let logDirGone = false
-  try {
-    await stat(logDir)
-  } catch {
-    logDirGone = true
-  }
-  check('session log directory is removed from disk', logDirGone)
-  check('archive record is cleared', !archived.has('s-temp'))
-  check('pin is cleared', !pinned.has('s-temp'))
-  check('workspace account is detached', detached.includes('s-temp'))
+  res = await call(routes, { method: 'POST', contentType: 'application/json', body: '{"sessionIds":["s-live"]}' })
+  check('live session reports session-live', res.statusCode === 200
+    && res.json().results[0].code === 'session-live', res.body)
 
-  // A second call is refused because the session is no longer archived.
-  res = await call(routes, { method: 'POST', contentType: 'application/json', body: '{"sessionId":"s-temp"}' })
-  check('repeating the deletion is refused, not repeated', res.statusCode === 409)
+  // ---- one deletion --------------------------------------------------------
+  res = await call(routes, { method: 'POST', contentType: 'application/json', body: '{"sessionIds":["s-one"]}' })
+  const single = res.json().results[0]
+  check('deletion answers 200 with an ok result', res.statusCode === 200 && single.ok === true, res.body)
+  check('deletion reports the removed directory', single.logDir === logs.get('s-one').dir, String(single.logDir))
+  check('no warnings on the happy path', Array.isArray(single.warnings) && single.warnings.length === 0)
+  check('session log directory is removed from disk', await gone(logs.get('s-one').dir))
+  check('archive record is cleared', !archived.has('s-one'))
+  check('pin is cleared', !pinned.has('s-one'))
+  check('every workspace account is detached', detached.includes('s-one'))
 
-  // A failed filesystem removal must leave the archive record untouched.
-  const lockedDir = join(root, 'proj', 's-locked')
-  await mkdir(lockedDir, { recursive: true })
-  const lockedFile = join(lockedDir, 'session.4.jsonl')
-  await writeFile(lockedFile, 'x\n', 'utf8')
-  archived.add('s-locked')
-  const failRoutes = new Map()
-  // Point the removal step under a regular file, so the directory removal is
-  // refused by the filesystem itself (ENOTDIR) rather than by the fake.
-  const failingPersistence = {
-    async stat() {
-      return { location: { kind: 'jsonl', path: join(lockedFile, 'not-a-dir', 'session.jsonl') } }
-    },
-  }
-  apply(makeContext({ workspaceRegistry: registry, sessionPersistence: failingPersistence, sessions }, failRoutes))
-  res = await call(failRoutes, { method: 'POST', contentType: 'application/json', body: '{"sessionId":"s-locked"}' })
-  check('a failing removal answers 500', res.statusCode === 500, `status ${res.statusCode} ${res.body}`)
+  res = await call(routes, { method: 'POST', contentType: 'application/json', body: '{"sessionIds":["s-one"]}' })
+  check('repeating the deletion is refused, not repeated', res.statusCode === 200
+    && res.json().results[0].code === 'session-not-archived', res.body)
+
+  // ---- a batch keeps going past a refusal ----------------------------------
+  detached.length = 0
+  res = await call(routes, {
+    method: 'POST',
+    contentType: 'application/json',
+    body: '{"sessionIds":["s-two","s-other","s-two"]}',
+  })
+  const batch = res.json().results
+  check('batch answers one entry per distinct id', batch.length === 2, JSON.stringify(batch))
+  check('batch deletes the archived Session', batch[0].sessionId === 's-two' && batch[0].ok === true)
+  check('batch continues past a refused Session', batch[1].code === 'session-not-archived')
+  check('batch removes that log too', await gone(logs.get('s-two').dir))
+  check('batch detaches from every accounting workspace', detached.includes('s-two') && detached.includes('two:s-two'))
+
+  // ---- a failed filesystem removal changes nothing -------------------------
+  res = await call(routes, { method: 'POST', contentType: 'application/json', body: '{"sessionIds":["s-locked"]}' })
+  check('a failing removal reports delete-failed', res.statusCode === 200
+    && res.json().results[0].code === 'delete-failed', res.body)
   check('a failing removal keeps the archive record', archived.has('s-locked'))
+  check('a failing removal keeps the log on disk', !(await gone(logs.get('s-locked').dir)))
 } finally {
   await rm(root, { recursive: true, force: true })
 }

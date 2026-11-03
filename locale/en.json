@@ -1,20 +1,43 @@
 {
   "meta": {
     "title": "Delete archived conversation",
-    "description": "Adds a delete key to archived conversations in the sidebar and removes the session log from disk."
+    "description": "Adds a delete key to archived conversations in the sidebar: one at a time or in a batch, with an optional \"do not ask again today\" switch that removes the session logs from disk."
   },
   "menu": {
-    "delete": "Delete archived conversation"
+    "delete": "Delete archived conversation",
+    "batch": "Delete archived conversations…",
+    "restoreConfirm": "Ask before deleting again"
   },
   "actions": {
-    "delete": "Delete this archived conversation permanently"
+    "delete": "Delete this archived conversation permanently",
+    "deleteDirect": "Delete permanently (no confirmation today)"
   },
   "confirm": {
     "title": "Delete this conversation permanently?",
     "desc": "“{title}” is removed from disk: its session log, its archive record, and its workspace entry are all deleted. This cannot be undone.",
     "untitled": "Untitled conversation",
+    "rememberToday": "Do not ask me again today",
     "pending": "Deleting…",
     "action": "Delete permanently"
+  },
+  "batch": {
+    "title": "Delete archived conversations",
+    "desc": "Select the conversations to remove. Their logs, archive records and workspace entries are deleted, and this cannot be undone.",
+    "selectAll": "Select all",
+    "clearAll": "Clear",
+    "count": "{n} of {total} selected",
+    "empty": "No archived conversations.",
+    "action": "Delete {n}",
+    "actionNone": "Delete",
+    "rememberToday": "Do not ask me again today"
+  },
+  "notice": {
+    "deleting": "Deleting…",
+    "deleted": "Deleted {n} conversation(s).",
+    "partial": "Deleted {ok}, {failed} failed: {detail}",
+    "failed": "Delete failed: {detail}",
+    "confirmOff": "Delete confirmation is off for today.",
+    "confirmOn": "Delete confirmation is back on."
   },
   "cancel": "Cancel",
   "close": "Close"

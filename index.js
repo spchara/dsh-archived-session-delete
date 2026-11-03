@@ -1,21 +1,25 @@
 /**
  * Host half of archived-session-delete: one route,
- * `POST /archived-session-delete/purge`, that removes an ARCHIVED Session for
- * good.
+ * `POST /archived-session-delete/purge`, that removes ARCHIVED Sessions for
+ * good — one Session, or a batch of them.
  *
- * The order of operations is deliberate. The Session log directory is removed
- * first: that is the step that can fail for an external reason (a Windows
- * sharing violation, a permission refusal), and failing it must leave the
- * archive set untouched so the row still shows and the user can retry. Only
- * after the log is gone are the registry records cleaned up — the archive set,
- * the pin, and every Workspace account that still lists the Session — with
- * each cleanup step reported as a warning instead of discarding a deletion
- * that already happened.
+ * The order of operations is deliberate, and applies per Session. The log
+ * directory is removed first: that is the step that can fail for an external
+ * reason (a Windows sharing violation, a permission refusal), and failing it
+ * must leave the archive set untouched so the row still shows and the user can
+ * retry. Only after the log is gone are the registry records cleaned up — the
+ * archive set, the pin, and every Workspace account that still lists the
+ * Session — with each cleanup step reported as a warning instead of discarding
+ * a deletion that already happened.
+ *
+ * A batch answers `200` with one entry per Session: one that is no longer
+ * archived, or still live, is that entry's refusal and never stops the rest of
+ * the batch.
  *
  * Guards: the trust fence (`connection.requestRejection`) answers before
- * anything else, the caller must use POST with an `application/json` body, the
- * Session must be archived (that is the surface this plugin serves), and it
- * must not be live (a live Session owns a write handle).
+ * anything else, the caller must use POST with an `application/json` body, and
+ * every named Session must be archived (that is the surface this plugin
+ * serves) and not live (a live Session owns a write handle).
  *
  * @module archived-session-delete
  */
@@ -26,14 +30,17 @@ import { rm, stat } from 'node:fs/promises'
 /** Cordis function-plugin name. */
 export const name = 'archived-session-delete'
 
-/** The route carrier; `connection` is read optionally so a composition without the trust fence still loads. */
+/** The route carrier; every other service is read through `ctx.get`. */
 export const inject = ['webServer']
 
 /** Absolute pathname the Host registers; the browser addresses it document-relative. */
 const PURGE_PATH = '/archived-session-delete/purge'
 
-/** A Session id body is tiny; anything larger is hostile. */
-const MAX_BODY_BYTES = 8 * 1024
+/** A request body is a short id list; anything larger is hostile. */
+const MAX_BODY_BYTES = 32 * 1024
+
+/** One request may name at most this many Sessions. */
+const MAX_BATCH = 200
 
 /** Accepted Session id shape: no path separators, so a crafted id can never steer a deletion. */
 const SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
@@ -62,7 +69,8 @@ export function apply(ctx) {
 }
 
 /**
- * Answer one purge request.
+ * Answer one purge request: validate the envelope, then delete each named
+ * Session and report it separately.
  * @param ctx - the plugin context (services are read here, not captured).
  * @param req - the incoming request.
  * @param res - the response to complete.
@@ -95,9 +103,12 @@ async function purge(ctx, req, res) {
   } catch {
     payload = null
   }
-  const sessionId = typeof payload?.sessionId === 'string' ? payload.sessionId : ''
-  if (!SESSION_ID.test(sessionId)) {
-    sendJson(res, 400, { code: 'bad-request', message: 'request body must carry a string "sessionId"' })
+  const sessionIds = requestedIds(payload)
+  if (sessionIds === null) {
+    sendJson(res, 400, {
+      code: 'bad-request',
+      message: `request body must carry "sessionIds" with 1 to ${String(MAX_BATCH)} session ids`,
+    })
     return
   }
 
@@ -112,21 +123,6 @@ async function purge(ctx, req, res) {
     })
     return
   }
-  if (!registry.archivedSessionIds.includes(sessionId)) {
-    sendJson(res, 409, {
-      code: 'session-not-archived',
-      message: `session '${sessionId}' is not archived, so this surface does not delete it`,
-    })
-    return
-  }
-  const sessions = ctx.get('sessions')
-  if (sessions !== undefined && sessions.get(sessionId) !== undefined) {
-    sendJson(res, 409, {
-      code: 'session-live',
-      message: `session '${sessionId}' is live in this process; close it before deleting it`,
-    })
-    return
-  }
   const persistence = ctx.get('sessionPersistence')
   if (persistence === undefined) {
     sendJson(res, 501, {
@@ -134,6 +130,48 @@ async function purge(ctx, req, res) {
       message: 'this composition has no session persistence, so there is no stored log to delete',
     })
     return
+  }
+  const sessions = ctx.get('sessions')
+
+  const results = []
+  for (const sessionId of sessionIds) {
+    results.push(await purgeOne({ ctx, registry, persistence, sessions }, sessionId))
+  }
+  sendJson(res, 200, { results })
+}
+
+/**
+ * Normalize the request body into a de-duplicated id list.
+ * @param payload - the parsed JSON body.
+ * @returns the ids, or null when the body is unusable.
+ */
+function requestedIds(payload) {
+  const raw = Array.isArray(payload?.sessionIds)
+    ? payload.sessionIds
+    : (typeof payload?.sessionId === 'string' ? [payload.sessionId] : null)
+  if (raw === null || raw.length === 0 || raw.length > MAX_BATCH) return null
+  const ids = []
+  for (const value of raw) {
+    if (typeof value !== 'string' || !SESSION_ID.test(value)) return null
+    if (!ids.includes(value)) ids.push(value)
+  }
+  return ids
+}
+
+/**
+ * Delete one archived Session.
+ * @param services - the services resolved for this request.
+ * @param sessionId - the Session to remove.
+ * @returns one result entry; a refusal is data, not a thrown error.
+ */
+async function purgeOne({ ctx, registry, persistence, sessions }, sessionId) {
+  const refuse = (code, message) => ({ sessionId, ok: false, code, message })
+
+  if (!registry.archivedSessionIds.includes(sessionId)) {
+    return refuse('session-not-archived', `session '${sessionId}' is not archived, so this surface does not delete it`)
+  }
+  if (sessions !== undefined && sessions.get(sessionId) !== undefined) {
+    return refuse('session-live', `session '${sessionId}' is live in this process; close it before deleting it`)
   }
 
   // Step 1: the stored log directory. Failing here changes nothing else.
@@ -158,11 +196,7 @@ async function purge(ctx, req, res) {
       }
     }
   } catch (failure) {
-    sendJson(res, 500, {
-      code: 'delete-failed',
-      message: `cannot delete the stored log of session '${sessionId}': ${messageOf(failure)}`,
-    })
-    return
+    return refuse('delete-failed', `cannot delete the stored log of session '${sessionId}': ${messageOf(failure)}`)
   }
 
   // Step 2: the records that still point at it. The log is already gone, so a
@@ -183,7 +217,7 @@ async function purge(ctx, req, res) {
     await cleanup(`detach from workspace '${workspace.id}'`, () => workspace.detachSession(sessionId))
   }
 
-  sendJson(res, 200, { deleted: true, sessionId, logDir, warnings })
+  return { sessionId, ok: true, logDir, warnings }
 }
 
 /**
