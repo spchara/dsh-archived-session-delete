@@ -40,11 +40,14 @@ window.__ModuleLoader__.load({
         'batch.rememberToday': 'Do not ask me again today',
         'notice.deleting': 'Deleting…',
         'notice.deleted': 'Deleted {n} conversation(s).',
+        'notice.deferredOnly': 'Removed {m} conversation(s) from the list; they are still open, so their logs are cleared on the next DSH start.',
+        'notice.deferredSuffix': ' ({m} still open: their logs are cleared on the next DSH start)',
         'notice.partial': 'Deleted {ok}, {failed} failed: {detail}',
         'notice.failed': 'Delete failed: {detail}',
         'notice.confirmOff': 'Delete confirmation is off for today.',
         'notice.confirmOn': 'Delete confirmation is back on.',
-        'error.sessionLive': 'This conversation is open right now; switch to another one first.',
+        'error.sessionBusy': 'This conversation is still working; delete it once the turn finishes.',
+        'error.sessionLive': 'This conversation is open and has no stored log to queue.',
         'error.sessionNotFound': 'That conversation no longer exists (already deleted?).',
         'error.deleteFailed': 'The stored log could not be removed.',
         'cancel': 'Cancel',
@@ -73,11 +76,14 @@ window.__ModuleLoader__.load({
         'batch.rememberToday': '今天不再提醒我',
         'notice.deleting': '正在删除…',
         'notice.deleted': '已删除 {n} 个会话。',
+        'notice.deferredOnly': '已从列表移除 {m} 个会话；它们还开着，日志会在下次启动 DSH 时清理。',
+        'notice.deferredSuffix': '（其中 {m} 个还开着，日志会在下次启动 DSH 时清理）',
         'notice.partial': '已删除 {ok} 个，{failed} 个失败：{detail}',
         'notice.failed': '删除失败：{detail}',
         'notice.confirmOff': '今天不再弹出删除确认。',
         'notice.confirmOn': '已恢复删除前的确认。',
-        'error.sessionLive': '这个会话当前是打开状态，先切换到别的会话再删。',
+        'error.sessionBusy': '这个会话还在跑，等这一轮结束再删。',
+        'error.sessionLive': '这个会话开着，而且没有可排队的日志。',
         'error.sessionNotFound': '这个会话已经不在了（可能已被删除）。',
         'error.deleteFailed': '会话日志删不掉。',
         'cancel': '取消',
@@ -335,6 +341,7 @@ window.__ModuleLoader__.load({
 
     /** Host refusal codes with their own copy; anything else shows the Host's message. */
     const FAILURE_KEYS = {
+      'session-busy': 'error.sessionBusy',
       'session-live': 'error.sessionLive',
       'session-not-found': 'error.sessionNotFound',
       'delete-failed': 'error.deleteFailed',
@@ -355,6 +362,11 @@ window.__ModuleLoader__.load({
 
     /**
      * Delete the named Sessions and report the outcome as one notice.
+     *
+     * A Session that is still open cannot lose its log yet: the Host clears its
+     * records now and queues the log for the next start, so the notice says how
+     * many were removed outright and how many are waiting.
+     *
      * @param sessionIds - the Sessions to remove.
      * @param labels - display titles by Session id, so a refusal names the row.
      */
@@ -368,10 +380,17 @@ window.__ModuleLoader__.load({
         showNotice('error', translate('notice.failed', { detail: messageOf(failure) }))
         return
       }
-      const ok = results.filter(entry => entry.ok === true).length
+      const done = results.filter(entry => entry.ok === true)
+      const deferred = done.filter(entry => entry.deferred === true).length
+      const removed = done.length - deferred
       const failed = results.filter(entry => entry.ok !== true)
+      const suffix = deferred === 0 ? '' : translate('notice.deferredSuffix', { m: deferred })
       if (failed.length === 0) {
-        showNotice('ok', translate('notice.deleted', { n: ok }))
+        if (removed === 0) {
+          showNotice('ok', translate('notice.deferredOnly', { m: deferred }))
+          return
+        }
+        showNotice('ok', `${translate('notice.deleted', { n: removed })}${suffix}`)
         return
       }
       const detail = failed
@@ -381,11 +400,11 @@ window.__ModuleLoader__.load({
           return `${label}: ${describeFailure(entry)}`
         })
         .join('; ')
-      if (ok === 0) {
+      if (done.length === 0) {
         showNotice('error', translate('notice.failed', { detail }))
         return
       }
-      showNotice('error', translate('notice.partial', { ok, failed: failed.length, detail }))
+      showNotice('error', `${translate('notice.partial', { ok: done.length, failed: failed.length, detail })}${suffix}`)
     }
 
     /**

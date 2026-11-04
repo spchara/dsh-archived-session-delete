@@ -34,9 +34,23 @@ dsh plugin --profile web add link:D:\path\to\dsh-archived-session-delete
 
 **批量删除**：面板按归档顺序列出全部归档会话（标题取自会话列表），默认一个都不勾，按钮上写 `彻底删除 N 项`；删完弹结果通知（成功几个 / 失败几个 + 原因），6 秒自动消失。
 
-**当前正在打开的会话删不了**：它在本进程里还活着，Host 会拒绝并提示先切到别的会话。这是有意为之——删除一个还持有写句柄的会话会留下损坏的日志。
-
 **不可恢复**，没有回收站。
+
+## 还开着的会话怎么办
+
+DSH 的 Host 一旦为某个会话建过 Agent，就会一直持有它的写句柄，而且**没有对外释放的接口**（句柄只属于 session-controller）。所以「切到别的会话再删」并不能让它变成可删——日志被一个活着的写者按着，Windows 上连目录都删不掉。
+
+插件因此分三种情况处理：
+
+| 会话状态 | 行为 |
+| --- | --- |
+| 没被打开过 | **立刻删除**日志目录 |
+| 打开过、当前空闲 | **立刻从列表移除**（归档/置顶/工作区归属都清），日志**排队到下次启动 DSH 时删除** |
+| 打开过、还在跑（回合/子代理/任务/定时） | **拒绝**，提示等这一轮结束 |
+
+排队记录写在 `$DSH_HOME/archived-session-delete/pending.json`，每条带日志的 revision。下次启动时逐条比对：revision 没变才删；**如果你删完又继续在那个会话里聊，revision 变了，排队项自动作废**，不会把新内容一起删掉。
+
+副作用：被删的会话如果还开在屏幕上，它的历史仍在内存里直到重启——但侧边栏里已经没有它了。
 
 ## 删了什么
 
@@ -56,7 +70,8 @@ dsh plugin --profile web add link:D:\path\to\dsh-archived-session-delete
 `POST /archived-session-delete/purge`，body `{ "sessionIds": ["s-1", "s-2"] }`（1–200 条，也接受单条 `sessionId` 写法）。
 
 - 信封层拒绝：非 POST → 405、非 JSON → 415、id 形状可疑 / 空数组 / 超长 → 400、没有 `workspaceRegistry` 或 `sessionPersistence` → 501。
-- 业务层（HTTP 200，逐条报告）：`[{ sessionId, ok: true, logDir, warnings }]` 或 `[{ sessionId, ok: false, code, message }]`，`code` 为 `session-not-found`（既无日志也不在归档集）/ `session-live`（当前打开）/ `delete-failed`（日志删不掉）。一条被拒不影响同批其他条。
+- 业务层（HTTP 200，逐条报告）：`[{ sessionId, ok: true, logDir, warnings }]`、`[{ sessionId, ok: true, deferred: true, warnings }]`（还开着，已排队）或 `[{ sessionId, ok: false, code, message }]`。
+- `code`：`session-not-found`（既无日志也不在归档集）/ `session-busy`（还在跑）/ `session-live`（开着但没有可排队的日志）/ `delete-failed`（日志删不掉）。一条被拒不影响同批其他条。
 - 浏览器请求先过 `connection.requestRejection`（Host/Origin 栅栏 + 登录凭据），不过直接 401/403，碰不到数据。
 
 会话是否可删由持久层决定：有日志文件、或仍在归档集里，就算"存在"；都不是就按未知 id 拒绝，不会误报成功。
@@ -65,7 +80,7 @@ dsh plugin --profile web add link:D:\path\to\dsh-archived-session-delete
 
 | 文件 | 作用 |
 | --- | --- |
-| `index.js` | Host 半：路由、校验、逐条删除与注册表清理 |
+| `index.js` | Host 半：路由、校验、逐条删除、注册表清理、启动时的排队清理 |
 | `client.js` | Client 半：3 个菜单项 + 行尾按钮 + 确认/批量面板 + 结果通知（都在已有 slot 里） |
 | `cordis.patch.yml` | 插入 `archived-session-delete` 一行 |
 | `locale/*.json` | 插件管理页显示的标题/描述 |
@@ -76,7 +91,7 @@ dsh plugin --profile web add link:D:\path\to\dsh-archived-session-delete
 ## 开发
 
 ```powershell
-node test/host.route.mjs     # 27 项检查：信封拒绝、逐条拒绝、单条/未归档删除、批量继续、拒绝路径不动数据
+node test/host.route.mjs     # 36 项检查：信封拒绝、逐条拒绝、单条/未归档删除、批量继续、排队与启动清理、revision 守卫
 ```
 
 改 `client.js` 刷新页面即可；改 `index.js`（Host 半）需要重启 DSH 才会加载新模块。
@@ -85,4 +100,5 @@ node test/host.route.mjs     # 27 项检查：信封拒绝、逐条拒绝、单�
 
 - 批量面板只列**归档**会话，按归档顺序，不做搜索/筛选（归档量很大时可以再加）。
 - 行尾垃圾桶图标固定只对归档行显示：想让它也出现在普通会话上，把 `client.js` 里 `ArchiveDeleteRowButton` 的那句 `if (!archived) return null` 删掉即可。
+- 排队清理只在启动时跑一次；想立刻清掉，重启 DSH 即可（或删掉 `pending.json` 放弃排队）。
 - 搜索索引（sqlite）由它自己的文件观察器跟随清理，观察器没跑时要等下次扫描。

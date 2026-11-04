@@ -5,28 +5,44 @@
  * deleted the same way; the only difference is that the archived one also has
  * a record in the archive set to clear.
  *
+ * Two things decide what "delete" can mean for one Session.
+ *
+ * 1. Is it live? A Session that this process still holds an Agent for owns an
+ *    open write lease, and its log cannot be removed under it (Windows refuses
+ *    the directory, and a recreated log would lose its header). The Host offers
+ *    no way to release an Agent from outside — the handle belongs to the
+ *    session controller — so a live Session is DEFERRED instead: its registry
+ *    records are cleared now (the row disappears immediately) and its log is
+ *    queued for the next start, when nothing holds it. The queue records the
+ *    log's revision, so a Session the user keeps talking in is left alone
+ *    rather than losing the new turns.
+ * 2. Is it working? A live Session with a running turn, subagent, job or
+ *    schedule is refused: deleting a conversation mid-turn would discard work
+ *    the user can still see happening.
+ *
  * The order of operations is deliberate, and applies per Session. The log
  * directory is removed first: that is the step that can fail for an external
- * reason (a Windows sharing violation, a permission refusal), and failing it
- * must leave the registry records untouched so the row still shows and the
- * user can retry. Only after the log is gone are those records cleaned up —
- * the archive set, the pin, and every Workspace account that still lists the
- * Session — with each cleanup step reported as a warning instead of discarding
- * a deletion that already happened.
+ * reason (a sharing violation, a permission refusal), and failing it must
+ * leave the registry records untouched so the row still shows and the user can
+ * retry. Only after the log is gone are those records cleaned up — the archive
+ * set, the pin, and every Workspace account that still lists the Session —
+ * with each cleanup step reported as a warning instead of discarding a
+ * deletion that already happened.
  *
  * A batch answers `200` with one entry per Session: one that is unknown, or
- * still live, is that entry's refusal and never stops the rest of the batch.
+ * busy, is that entry's refusal and never stops the rest of the batch.
  *
  * Guards: the trust fence (`connection.requestRejection`) answers before
  * anything else, the caller must use POST with an `application/json` body, and
- * every named Session must be identifiable (a stored log, or an archive record)
- * and not live (a live Session owns a write handle).
+ * every named Session must be identifiable (a stored log, or an archive
+ * record).
  *
  * @module archived-session-delete
  */
 
-import { dirname } from 'node:path'
-import { rm, stat } from 'node:fs/promises'
+import { homedir } from 'node:os'
+import { dirname, join } from 'node:path'
+import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 
 /** Cordis function-plugin name. */
 export const name = 'archived-session-delete'
@@ -47,7 +63,8 @@ const MAX_BATCH = 200
 const SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
 
 /**
- * Register the purge route on the composition's web server.
+ * Register the purge route, and drain the deferred queue once the services it
+ * needs exist.
  * @param ctx - the plugin context carrying `webServer`.
  */
 export function apply(ctx) {
@@ -67,6 +84,14 @@ export function apply(ctx) {
       })
     },
   }), `archived-session-delete: POST ${PURGE_PATH}`)
+
+  // Deferred deletions are drained at start, when no Agent holds those logs.
+  // `inject` keeps the plugin loadable in a composition without persistence.
+  ctx.inject(['sessionPersistence', 'workspaceRegistry'], (scoped) => {
+    void drainDeferred(scoped).catch((failure) => {
+      scoped.logger?.warn?.(`archived-session-delete: deferred drain failed: ${messageOf(failure)}`)
+    })
+  })
 }
 
 /**
@@ -175,41 +200,85 @@ function requestedIds(payload) {
 async function purgeOne({ ctx, registry, persistence, sessions }, sessionId) {
   const refuse = (code, message) => ({ sessionId, ok: false, code, message })
 
-  if (sessions !== undefined && sessions.get(sessionId) !== undefined) {
-    return refuse('session-live', `session '${sessionId}' is live in this process; close it before deleting it`)
-  }
   const archived = registry.archivedSessionIds.includes(sessionId)
+  const live = sessions !== undefined && sessions.get(sessionId) !== undefined
+
+  let snapshot
+  try {
+    snapshot = await persistence.stat(sessionId)
+  } catch (failure) {
+    return refuse('delete-failed', `cannot read the stored log of session '${sessionId}': ${messageOf(failure)}`)
+  }
+  if (snapshot === undefined && !archived) {
+    return refuse('session-not-found', `session '${sessionId}' has no stored log and is not archived`)
+  }
+
+  if (live) {
+    // A live Session cannot lose its log under its own writer. Refuse while it
+    // is working; otherwise clear the records now and queue the log.
+    const activity = await ctx.waterfall(
+      'workspace/session-activity', { sessionId }, () => Promise.resolve([]),
+    ).catch(() => [])
+    if (activity.length > 0) {
+      const kinds = activity.map(entry => entry.kind).join(', ')
+      return refuse('session-busy', `session '${sessionId}' is still working (${kinds})`)
+    }
+    const revision = typeof snapshot?.revision === 'string' ? snapshot.revision : null
+    if (revision === null) {
+      return refuse('session-live', `session '${sessionId}' is open in this process and has no stored log to queue`)
+    }
+    await enqueueDeferred(sessionId, revision)
+    const warnings = await cleanRecords(ctx, registry, sessionId)
+    return { sessionId, ok: true, deferred: true, logDir: null, warnings }
+  }
 
   // Step 1: the stored log directory. Failing here changes nothing else.
   let logDir = null
   try {
-    const snapshot = await persistence.stat(sessionId)
-    if (snapshot === undefined && !archived) {
-      return refuse('session-not-found', `session '${sessionId}' has no stored log and is not archived`)
-    }
-    const path = snapshot?.location?.path
-    if (typeof path === 'string' && path.length > 0) {
-      logDir = dirname(path)
-      // The backend's answer is a precondition, not a fact: only a real
-      // directory is removed, so a snapshot naming something else refuses
-      // instead of reporting a deletion that never happened.
-      const before = await stat(logDir)
-      if (!before.isDirectory()) {
-        throw new Error(`the stored log path is not inside a session directory: ${path}`)
-      }
-      await rm(logDir, { recursive: true, force: true })
-      // `force` also suppresses a path that resolves through a non-directory,
-      // so the removal is proved by the path being gone, not by rm resolving.
-      if (await exists(logDir)) {
-        throw new Error(`the stored log directory is still there: ${logDir}`)
-      }
-    }
+    logDir = await removeLog(snapshot)
   } catch (failure) {
     return refuse('delete-failed', `cannot delete the stored log of session '${sessionId}': ${messageOf(failure)}`)
   }
 
   // Step 2: the records that still point at it. The log is already gone, so a
   // failure here is reported beside a successful deletion instead of undoing it.
+  const warnings = await cleanRecords(ctx, registry, sessionId)
+  return { sessionId, ok: true, logDir, warnings }
+}
+
+/**
+ * Remove one Session's stored log directory, proving the removal happened.
+ * @param snapshot - the backend's snapshot for that Session.
+ * @returns the removed directory, or null when the backend named no artifact.
+ */
+async function removeLog(snapshot) {
+  const path = snapshot?.location?.path
+  if (typeof path !== 'string' || path.length === 0) return null
+  const logDir = dirname(path)
+  // The backend's answer is a precondition, not a fact: only a real directory
+  // is removed, so a snapshot naming something else refuses instead of
+  // reporting a deletion that never happened.
+  const before = await stat(logDir)
+  if (!before.isDirectory()) {
+    throw new Error(`the stored log path is not inside a session directory: ${path}`)
+  }
+  await rm(logDir, { recursive: true, force: true })
+  // `force` also suppresses a path that resolves through a non-directory, so
+  // the removal is proved by the path being gone, not by rm resolving.
+  if (await exists(logDir)) {
+    throw new Error(`the stored log directory is still there: ${logDir}`)
+  }
+  return logDir
+}
+
+/**
+ * Clear the records that still point at one Session.
+ * @param ctx - the plugin context (for logging).
+ * @param registry - the workspace registry.
+ * @param sessionId - the Session to forget.
+ * @returns the failures, as warnings; a failure never undoes a deletion.
+ */
+async function cleanRecords(ctx, registry, sessionId) {
   const warnings = []
   const cleanup = async (label, action) => {
     try {
@@ -225,9 +294,118 @@ async function purgeOne({ ctx, registry, persistence, sessions }, sessionId) {
     if (!workspace.sessionIds.includes(sessionId)) continue
     await cleanup(`detach from workspace '${workspace.id}'`, () => workspace.detachSession(sessionId))
   }
-
-  return { sessionId, ok: true, logDir, warnings }
+  return warnings
 }
+
+// ------------------------------------------------------------ deferred queue
+
+/** Directory holding this plugin's own state, beside the rest of the Harness home. */
+function stateDir() {
+  const home = typeof process.env.DSH_HOME === 'string' && process.env.DSH_HOME !== ''
+    ? process.env.DSH_HOME
+    : join(homedir(), '.dsh')
+  return join(home, 'archived-session-delete')
+}
+
+/** The deferred-deletion queue file. */
+function pendingFile() {
+  return join(stateDir(), 'pending.json')
+}
+
+/**
+ * Read the deferred queue.
+ * @returns the entries; an unreadable or malformed file reads as empty.
+ */
+async function readDeferred() {
+  let text
+  try {
+    text = await readFile(pendingFile(), 'utf8')
+  } catch {
+    return []
+  }
+  let parsed
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    return []
+  }
+  const entries = Array.isArray(parsed?.entries) ? parsed.entries : []
+  return entries.filter(entry => typeof entry?.sessionId === 'string'
+    && SESSION_ID.test(entry.sessionId)
+    && typeof entry.revision === 'string')
+}
+
+/**
+ * Replace the deferred queue.
+ * @param entries - the entries to keep.
+ */
+async function writeDeferred(entries) {
+  const dir = stateDir()
+  await mkdir(dir, { recursive: true })
+  const file = pendingFile()
+  const temporary = `${file}.tmp`
+  await writeFile(temporary, `${JSON.stringify({ version: 1, entries }, null, 2)}\n`, 'utf8')
+  await rename(temporary, file)
+}
+
+/**
+ * Queue one Session's log for the next start.
+ * @param sessionId - the Session to remove later.
+ * @param revision - the log revision seen now; a later change cancels the entry.
+ */
+async function enqueueDeferred(sessionId, revision) {
+  const entries = await readDeferred()
+  const kept = entries.filter(entry => entry.sessionId !== sessionId)
+  kept.push({ sessionId, revision, queuedAt: new Date().toISOString() })
+  await writeDeferred(kept)
+}
+
+/**
+ * Delete every queued log that has not changed since it was queued.
+ *
+ * Exported because the startup hook is not the only caller: the check drives
+ * it directly, and a future "retry now" surface would too.
+ *
+ * @param ctx - a context carrying `sessionPersistence` and `workspaceRegistry`.
+ */
+export async function drainDeferred(ctx) {
+  const entries = await readDeferred()
+  if (entries.length === 0) return
+  const persistence = ctx.get('sessionPersistence')
+  const registry = ctx.get('workspaceRegistry')
+  if (persistence === undefined || registry === undefined) return
+  const sessions = ctx.get('sessions')
+  const keep = []
+  for (const entry of entries) {
+    const { sessionId, revision } = entry
+    // A Session opened before the drain ran is still held; keep it queued.
+    if (sessions !== undefined && sessions.get(sessionId) !== undefined) {
+      keep.push(entry)
+      continue
+    }
+    let snapshot
+    try {
+      snapshot = await persistence.stat(sessionId)
+    } catch {
+      keep.push(entry)
+      continue
+    }
+    if (snapshot === undefined) continue
+    // The user kept talking in it after asking to delete it: leave it alone.
+    if (snapshot.revision !== revision) continue
+    try {
+      await removeLog(snapshot)
+    } catch (failure) {
+      ctx.logger?.warn?.(`archived-session-delete: deferred removal of '${sessionId}' failed: ${messageOf(failure)}`)
+      keep.push(entry)
+      continue
+    }
+    await cleanRecords(ctx, registry, sessionId)
+  }
+  await writeDeferred(keep)
+}
+
+// ------------------------------------------------------------------ helpers
 
 /**
  * Ask the composition's connection service whether this request is untrusted.

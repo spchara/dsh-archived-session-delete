@@ -4,15 +4,16 @@
  * Drives the registered route handler with fake request/response objects and a
  * fake registry over REAL temporary session directories, so the deletion
  * semantics (log directory removed, registry cleaned up, per-Session refusals,
- * batch isolation) are exercised without the running profile or a browser.
+ * batch isolation, deferred removal of a Session that is still open) are
+ * exercised without the running profile or a browser.
  *
  * Run: node test/host.route.mjs
  */
 
-import { mkdir, mkdtemp, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { apply, inject, name } from '../index.js'
+import { apply, drainDeferred, inject, name } from '../index.js'
 
 let failures = 0
 const check = (label, condition, detail = '') => {
@@ -50,8 +51,13 @@ function makeResponse() {
   return res
 }
 
-/** Build one plugin context whose route handler can be invoked directly. */
-function makeContext(services, routes) {
+/**
+ * Build one plugin context whose route handler can be invoked directly.
+ * @param services - service stand-ins reachable through `get`.
+ * @param routes - sink for registered routes.
+ * @param state - mutable test knobs (`activity`, `injected`).
+ */
+function makeContext(services, routes, state = {}) {
   const ctx = {
     logger: { warn() {} },
     effect(callback) {
@@ -65,6 +71,17 @@ function makeContext(services, routes) {
       },
     },
     get(service) { return services[service] },
+    // The startup drain is wired through `inject`; record it instead of running it.
+    inject(deps, callback) {
+      state.injected = deps
+      state.injectedCallback = callback
+      return () => {}
+    },
+    // `workspace/session-activity`: whatever the test declared as running work.
+    waterfall(_name, _payload, fallback) {
+      const activity = state.activity ?? []
+      return activity.length === 0 ? fallback() : Promise.resolve(activity)
+    },
   }
   // Cordis refuses a bare `ctx.<service>` property that the plugin did not
   // declare in `inject`; reproduce that here so the check fails the same way
@@ -88,7 +105,7 @@ async function call(routes, options) {
   return res
 }
 
-/** One archived Session's log layout under the temporary root. */
+/** One Session's log layout under the temporary root. */
 async function makeLog(root, id) {
   const dir = join(root, 'proj', id)
   const file = join(dir, 'session.4.jsonl')
@@ -108,21 +125,27 @@ async function gone(path) {
 }
 
 const root = await mkdtemp(join(tmpdir(), 'asd-host-check-'))
+// The deferred queue lives under the Harness home; point it at the temp root.
+process.env.DSH_HOME = root
+const pendingFile = join(root, 'archived-session-delete', 'pending.json')
+
 try {
   console.log(`module: ${name}, inject: ${inject.join(',')}`)
 
   const logs = new Map()
-  for (const id of ['s-one', 's-two', 's-plain', 's-live']) logs.set(id, await makeLog(root, id))
+  for (const id of ['s-one', 's-two', 's-plain', 's-live', 's-busy', 's-kept']) {
+    logs.set(id, await makeLog(root, id))
+  }
   // A backend answer that is not a session directory: this id's "log path"
   // hangs off a regular file, so the directory precheck must refuse it.
   const notADir = join(root, 'proj', 's-bad')
   await writeFile(notADir, 'not a directory\n', 'utf8')
 
-  const archived = new Set(['s-one', 's-two', 's-live', 's-bad'])
+  const archived = new Set(['s-one', 's-two', 's-live', 's-busy', 's-bad'])
   const pinned = new Set(['s-one', 's-two'])
   const detached = []
   const workspaces = [
-    { id: 'ws-one', sessionIds: ['s-one', 's-two', 's-plain'], async detachSession(id) { detached.push(id) } },
+    { id: 'ws-one', sessionIds: ['s-one', 's-two', 's-plain', 's-live'], async detachSession(id) { detached.push(id) } },
     { id: 'ws-two', sessionIds: ['s-two'], async detachSession(id) { detached.push(`two:${id}`) } },
   ]
   const registry = {
@@ -131,6 +154,7 @@ try {
     async unpinSession(id) { pinned.delete(id) },
     list() { return workspaces },
   }
+  const revisions = new Map()
   const persistence = {
     async stat(id) {
       if (id === 's-bad') return { location: { kind: 'jsonl', path: join(notADir, 'session.jsonl') } }
@@ -138,14 +162,20 @@ try {
       if (entry === undefined) return undefined
       // The real backend re-reads the file, so a deleted log is no longer found.
       if (await gone(entry.dir)) return undefined
-      return { location: { kind: 'jsonl', path: entry.file } }
+      return { location: { kind: 'jsonl', path: entry.file }, revision: revisions.get(id) ?? 'rev-1' }
     },
   }
-  const sessions = { get(id) { return id === 's-live' ? {} : undefined } }
+  const live = new Set(['s-live', 's-busy'])
+  const sessions = { get(id) { return live.has(id) ? {} : undefined } }
 
+  const state = { activity: [] }
   const routes = new Map()
-  apply(makeContext({ workspaceRegistry: registry, sessionPersistence: persistence, sessions }, routes))
+  const ctx = makeContext({ workspaceRegistry: registry, sessionPersistence: persistence, sessions }, routes, state)
+  apply(ctx)
   check('route registered at the documented path', routes.has('/archived-session-delete/purge'))
+  check('startup drain is wired through inject', Array.isArray(state.injected)
+    && state.injected.includes('sessionPersistence')
+    && state.injected.includes('workspaceRegistry'), JSON.stringify(state.injected))
 
   // ---- envelope guards -----------------------------------------------------
   let res = await call(routes, { method: 'GET', contentType: 'application/json', body: '' })
@@ -170,10 +200,6 @@ try {
     && res.json().results[0].ok === false
     && res.json().results[0].code === 'session-not-found', res.body)
 
-  res = await call(routes, { method: 'POST', contentType: 'application/json', body: '{"sessionIds":["s-live"]}' })
-  check('live session reports session-live', res.statusCode === 200
-    && res.json().results[0].code === 'session-live', res.body)
-
   // ---- one deletion --------------------------------------------------------
   res = await call(routes, { method: 'POST', contentType: 'application/json', body: '{"sessionIds":["s-one"]}' })
   const single = res.json().results[0]
@@ -196,6 +222,46 @@ try {
   check('unarchived Session is deleted', res.statusCode === 200 && plain.ok === true, res.body)
   check('unarchived Session loses its log too', await gone(logs.get('s-plain').dir))
   check('unarchived Session is detached from its workspace', detached.includes('s-plain'))
+
+  // ---- a Session that is still open is deferred, not refused ---------------
+  detached.length = 0
+  res = await call(routes, { method: 'POST', contentType: 'application/json', body: '{"sessionIds":["s-live"]}' })
+  const deferred = res.json().results[0]
+  check('open Session answers ok with deferred', res.statusCode === 200
+    && deferred.ok === true && deferred.deferred === true, res.body)
+  check('open Session leaves its log for the next start', !(await gone(logs.get('s-live').dir)))
+  check('open Session is removed from the archive set now', !archived.has('s-live'))
+  check('open Session is detached from its workspace now', detached.includes('s-live'))
+  const queued = JSON.parse(await readFile(pendingFile, 'utf8'))
+  check('open Session is queued with its log revision', queued.entries.length === 1
+    && queued.entries[0].sessionId === 's-live'
+    && queued.entries[0].revision === 'rev-1', JSON.stringify(queued))
+
+  // ---- a Session that is still working is refused --------------------------
+  state.activity = [{ kind: 'turn' }]
+  res = await call(routes, { method: 'POST', contentType: 'application/json', body: '{"sessionIds":["s-busy"]}' })
+  check('working Session reports session-busy', res.statusCode === 200
+    && res.json().results[0].code === 'session-busy', res.body)
+  check('working Session keeps its log', !(await gone(logs.get('s-busy').dir)))
+  state.activity = []
+
+  // ---- the next start drains the queue -------------------------------------
+  const restart = makeContext({ workspaceRegistry: registry, sessionPersistence: persistence, sessions: { get() { return undefined } } }, new Map())
+  await drainDeferred(restart)
+  check('drain removes the queued log', await gone(logs.get('s-live').dir))
+  const afterDrain = JSON.parse(await readFile(pendingFile, 'utf8'))
+  check('drain empties the queue', afterDrain.entries.length === 0, JSON.stringify(afterDrain))
+
+  // ---- a log touched after queueing is left alone --------------------------
+  live.add('s-kept')
+  revisions.set('s-kept', 'rev-1')
+  res = await call(routes, { method: 'POST', contentType: 'application/json', body: '{"sessionIds":["s-kept"]}' })
+  check('a second open Session is queued too', res.json().results[0].deferred === true, res.body)
+  revisions.set('s-kept', 'rev-2')
+  await drainDeferred(restart)
+  check('a log changed since queueing survives the drain', !(await gone(logs.get('s-kept').dir)))
+  const keptQueue = JSON.parse(await readFile(pendingFile, 'utf8'))
+  check('a changed log cancels its queued deletion', keptQueue.entries.length === 0, JSON.stringify(keptQueue))
 
   // ---- a batch keeps going past a refusal ----------------------------------
   detached.length = 0
