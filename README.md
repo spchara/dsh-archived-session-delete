@@ -14,7 +14,7 @@ dsh plugin --profile web add github:spchara/dsh-archived-session-delete
 ```powershell
 # 方式二：克隆到本地，用 link 安装（改代码时方便）
 git clone https://github.com/spchara/dsh-archived-session-delete.git
-dsh plugin --profile web add link:D:\path\to\dsh-archived-session-delete
+dsh plugin --profile web add "link:<克隆到本地的绝对路径>"
 ```
 
 也可以在 DSH 的「设置 → 插件」里用**从本地目录安装**，选中这个仓库目录。装完刷新页面；删掉 `archived-session-delete` 那一行即卸载。
@@ -108,7 +108,7 @@ node test/host.route.mjs     # 42 项检查：信封拒绝、逐条拒绝、真�
 | `0.2.2-alpha.2` 及以后 | `stat()` 直接给 `location.path` |
 | `0.2.1-rc.x` / 更早 | `stat()` 没有 `location`（`SessionLocation` 只在解析错误的异常上），走 `$DSH_HOME/sessions` 扫描 |
 
-扫描规则已在真实的 326 个会话目录上验证（326/326 命中）。若你把 `session-persistence-jsonl` 的 root 配置到了 `$DSH_HOME/sessions` 以外，插件会明确报 `delete-failed`，而不是假装删掉。
+扫描规则已在真机的全部会话目录上逐个验证命中（目录名与编码后的 id 一一对应）。若你把 `session-persistence-jsonl` 的 root 配置到了 `$DSH_HOME/sessions` 以外，插件会明确报 `delete-failed`，而不是假装删掉。
 
 ## 已知边界
 
