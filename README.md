@@ -56,12 +56,17 @@ DSH 的 Host 一旦为某个会话建过 Agent，就会一直持有它的写句�
 
 对每条会话按顺序执行，前一步失败不会留下半截状态：
 
-1. **会话日志目录** `<sessions>/<project>/<session-id>/` —— 整目录移除（含 lease、迁移临时文件）。先确认真是目录、删完真不在，否则判为失败、注册表原样保留，可重试。
+1. **定位并删除会话日志目录** `<sessions>/<project>/<session-id>/`（整目录，含 lease、迁移临时文件）。
+   定位有两条来源，按顺序试：
+   - `sessionPersistence.stat()` 的 `snapshot.location.path` —— **只有 0.2.2-alpha 及以后才有这个字段**；
+   - 退回到扫描 `$DSH_HOME/sessions/<project>/<session-id>/`：只接受目录名恰好等于该 id 编码形式、且目录里真的有 `session*.jsonl*` 文件的那一个。
+   
+   **定位不到就是失败**（`delete-failed`），注册表原样保留 —— 绝不会出现"报成功、其实没删、还顺手把归档取消了"。
 2. **归档集合**（仅归档会话有）—— 归档行立刻从列表消失。
 3. **置顶标记**。
 4. **工作区归属** —— 每个仍登记该会话的 Workspace 上 `detachSession`。
 
-第 2–4 步失败只作为 `warnings` 回传并写日志，不会假装还原已删的日志。
+第 2–4 步失败只作为 `warnings` 回传并写日志，不会假装还原已删的日志；但它们**只在第 1 步确认成功（或已排队）之后**才执行。
 
 **不动**：内容寻址的附件对象（可能被别的会话共用）、其他会话、Workspace 目录本身。
 
@@ -71,7 +76,7 @@ DSH 的 Host 一旦为某个会话建过 Agent，就会一直持有它的写句�
 
 - 信封层拒绝：非 POST → 405、非 JSON → 415、id 形状可疑 / 空数组 / 超长 → 400、没有 `workspaceRegistry` 或 `sessionPersistence` → 501。
 - 业务层（HTTP 200，逐条报告）：`[{ sessionId, ok: true, logDir, warnings }]`、`[{ sessionId, ok: true, deferred: true, warnings }]`（还开着，已排队）或 `[{ sessionId, ok: false, code, message }]`。
-- `code`：`session-not-found`（既无日志也不在归档集）/ `session-busy`（还在跑）/ `session-live`（开着但没有可排队的日志）/ `delete-failed`（日志删不掉）。一条被拒不影响同批其他条。
+- `code`：`session-not-found`（既无日志也不在归档集）/ `session-busy`（还在跑）/ `session-live`（开着但没有可排队的日志）/ `delete-failed`（**日志定位不到或删不掉** —— 此时注册表不动）。一条被拒不影响同批其他条。
 - 浏览器请求先过 `connection.requestRejection`（Host/Origin 栅栏 + 登录凭据），不过直接 401/403，碰不到数据。
 
 会话是否可删由持久层决定：有日志文件、或仍在归档集里，就算"存在"；都不是就按未知 id 拒绝，不会误报成功。
@@ -91,10 +96,19 @@ DSH 的 Host 一旦为某个会话建过 Agent，就会一直持有它的写句�
 ## 开发
 
 ```powershell
-node test/host.route.mjs     # 36 项检查：信封拒绝、逐条拒绝、单条/未归档删除、批量继续、排队与启动清理、revision 守卫
+node test/host.route.mjs     # 42 项检查：信封拒绝、逐条拒绝、真实后端契约（无 location）下的删除与定位失败、批量继续、排队与启动清理、revision 守卫
 ```
 
 改 `client.js` 刷新页面即可；改 `index.js`（Host 半）需要重启 DSH 才会加载新模块。
+
+## 版本兼容
+
+| DSH 版本 | 日志定位 |
+| --- | --- |
+| `0.2.2-alpha.2` 及以后 | `stat()` 直接给 `location.path` |
+| `0.2.1-rc.x` / 更早 | `stat()` 没有 `location`（`SessionLocation` 只在解析错误的异常上），走 `$DSH_HOME/sessions` 扫描 |
+
+扫描规则已在真实的 326 个会话目录上验证（326/326 命中）。若你把 `session-persistence-jsonl` 的 root 配置到了 `$DSH_HOME/sessions` 以外，插件会明确报 `delete-failed`，而不是假装删掉。
 
 ## 已知边界
 

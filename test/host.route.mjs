@@ -2,10 +2,14 @@
  * Host-half check for @local/archived-session-delete.
  *
  * Drives the registered route handler with fake request/response objects and a
- * fake registry over REAL temporary session directories, so the deletion
- * semantics (log directory removed, registry cleaned up, per-Session refusals,
- * batch isolation, deferred removal of a Session that is still open) are
- * exercised without the running profile or a browser.
+ * fake registry over REAL temporary session directories.
+ *
+ * The fake backend follows the DEPLOYED contract, not a convenient one: on
+ * 0.2.1 releases `sessionPersistence.stat()` returns `{ revision, sizeBytes,
+ * formatStatus }` with NO `location`, so a deletion must resolve the session
+ * directory from `$DSH_HOME/sessions/<project>/<id>/` itself. A snapshot that
+ * yields no locatable directory must fail and leave the registry untouched —
+ * the regression this file exists to lock down.
  *
  * Run: node test/host.route.mjs
  */
@@ -59,7 +63,7 @@ function makeResponse() {
  */
 function makeContext(services, routes, state = {}) {
   const ctx = {
-    logger: { warn() {} },
+    logger: { warn() {}, debug() {} },
     effect(callback) {
       const disposer = callback()
       return typeof disposer === 'function' ? disposer : () => {}
@@ -105,15 +109,6 @@ async function call(routes, options) {
   return res
 }
 
-/** One Session's log layout under the temporary root. */
-async function makeLog(root, id) {
-  const dir = join(root, 'proj', id)
-  const file = join(dir, 'session.4.jsonl')
-  await mkdir(dir, { recursive: true })
-  await writeFile(file, '{"type":"turn/start"}\n', 'utf8')
-  return { dir, file }
-}
-
 /** Whether a path is gone. */
 async function gone(path) {
   try {
@@ -125,23 +120,36 @@ async function gone(path) {
 }
 
 const root = await mkdtemp(join(tmpdir(), 'asd-host-check-'))
-// The deferred queue lives under the Harness home; point it at the temp root.
+// The deferred queue and the sessions tree both hang off the Harness home.
 process.env.DSH_HOME = root
+const sessionsRoot = join(root, 'sessions')
 const pendingFile = join(root, 'archived-session-delete', 'pending.json')
+
+/** One Session's stored log at the layout the real backend uses. */
+async function makeLog(id, project) {
+  const dir = join(sessionsRoot, project, id)
+  const file = join(dir, 'session.v4.jsonl.zstd')
+  await mkdir(dir, { recursive: true })
+  await writeFile(file, 'stored log\n', 'utf8')
+  return { dir, file }
+}
 
 try {
   console.log(`module: ${name}, inject: ${inject.join(',')}`)
 
   const logs = new Map()
-  for (const id of ['s-one', 's-two', 's-plain', 's-live', 's-busy', 's-kept']) {
-    logs.set(id, await makeLog(root, id))
-  }
-  // A backend answer that is not a session directory: this id's "log path"
-  // hangs off a regular file, so the directory precheck must refuse it.
+  logs.set('s-one', await makeLog('s-one', 'proj-one'))
+  logs.set('s-two', await makeLog('s-two', 'proj-one'))
+  logs.set('s-plain', await makeLog('s-plain', 'proj-two'))
+  logs.set('s-live', await makeLog('s-live', 'proj-two'))
+  logs.set('s-busy', await makeLog('s-busy', 'proj-two'))
+  logs.set('s-kept', await makeLog('s-kept', 'proj-one'))
+  // A backend answer whose path is a regular file, not a session directory.
   const notADir = join(root, 'proj', 's-bad')
+  await mkdir(join(root, 'proj'), { recursive: true })
   await writeFile(notADir, 'not a directory\n', 'utf8')
 
-  const archived = new Set(['s-one', 's-two', 's-live', 's-busy', 's-bad'])
+  const archived = new Set(['s-one', 's-two', 's-live', 's-busy', 's-unlocatable', 's-bad'])
   const pinned = new Set(['s-one', 's-two'])
   const detached = []
   const workspaces = [
@@ -157,12 +165,20 @@ try {
   const revisions = new Map()
   const persistence = {
     async stat(id) {
-      if (id === 's-bad') return { location: { kind: 'jsonl', path: join(notADir, 'session.jsonl') } }
+      if (id === 's-bad') {
+        // 0.2.2-alpha style answer naming a path that is not a session directory.
+        return { revision: 'rev-bad', location: { kind: 'jsonl', path: join(notADir, 'session.jsonl') } }
+      }
+      if (id === 's-unlocatable') {
+        // A stored artifact the plugin cannot resolve: present, no location, no directory.
+        return { revision: 'rev-x', sizeBytes: 1, formatStatus: 'current' }
+      }
       const entry = logs.get(id)
       if (entry === undefined) return undefined
       // The real backend re-reads the file, so a deleted log is no longer found.
       if (await gone(entry.dir)) return undefined
-      return { location: { kind: 'jsonl', path: entry.file }, revision: revisions.get(id) ?? 'rev-1' }
+      // The deployed 0.2.1 contract: NO location field.
+      return { revision: revisions.get(id) ?? 'rev-1', sizeBytes: 12, formatStatus: 'current' }
     },
   }
   const live = new Set(['s-live', 's-busy'])
@@ -200,12 +216,12 @@ try {
     && res.json().results[0].ok === false
     && res.json().results[0].code === 'session-not-found', res.body)
 
-  // ---- one deletion --------------------------------------------------------
+  // ---- deletion with the DEPLOYED contract (no snapshot location) ----------
   res = await call(routes, { method: 'POST', contentType: 'application/json', body: '{"sessionIds":["s-one"]}' })
   const single = res.json().results[0]
-  check('deletion answers 200 with an ok result', res.statusCode === 200 && single.ok === true, res.body)
-  check('deletion reports the removed directory', single.logDir === logs.get('s-one').dir, String(single.logDir))
-  check('no warnings on the happy path', Array.isArray(single.warnings) && single.warnings.length === 0)
+  check('deletion without a snapshot location still succeeds', res.statusCode === 200
+    && single.ok === true, res.body)
+  check('the located directory is reported', single.logDir === logs.get('s-one').dir, String(single.logDir))
   check('session log directory is removed from disk', await gone(logs.get('s-one').dir))
   check('archive record is cleared', !archived.has('s-one'))
   check('pin is cleared', !pinned.has('s-one'))
@@ -222,6 +238,20 @@ try {
   check('unarchived Session is deleted', res.statusCode === 200 && plain.ok === true, res.body)
   check('unarchived Session loses its log too', await gone(logs.get('s-plain').dir))
   check('unarchived Session is detached from its workspace', detached.includes('s-plain'))
+
+  // ---- REGRESSION: an unresolvable log must fail, never "succeed" ----------
+  res = await call(routes, { method: 'POST', contentType: 'application/json', body: '{"sessionIds":["s-unlocatable"]}' })
+  const unresolved = res.json().results[0]
+  check('an unresolvable log reports delete-failed', res.statusCode === 200
+    && unresolved.ok === false && unresolved.code === 'delete-failed', res.body)
+  check('an unresolvable log is NOT unarchived', archived.has('s-unlocatable'))
+  check('an unresolvable log returns no success envelope', unresolved.logDir === undefined)
+
+  res = await call(routes, { method: 'POST', contentType: 'application/json', body: '{"sessionIds":["s-bad"]}' })
+  check('a named path that is not a session directory reports delete-failed', res.statusCode === 200
+    && res.json().results[0].code === 'delete-failed', res.body)
+  check('a refused deletion keeps the archive record', archived.has('s-bad'))
+  check('a refused deletion leaves that path alone', !(await gone(notADir)))
 
   // ---- a Session that is still open is deferred, not refused ---------------
   detached.length = 0
@@ -246,7 +276,11 @@ try {
   state.activity = []
 
   // ---- the next start drains the queue -------------------------------------
-  const restart = makeContext({ workspaceRegistry: registry, sessionPersistence: persistence, sessions: { get() { return undefined } } }, new Map())
+  const restart = makeContext({
+    workspaceRegistry: registry,
+    sessionPersistence: persistence,
+    sessions: { get() { return undefined } },
+  }, new Map())
   await drainDeferred(restart)
   check('drain removes the queued log', await gone(logs.get('s-live').dir))
   const afterDrain = JSON.parse(await readFile(pendingFile, 'utf8'))
@@ -263,6 +297,16 @@ try {
   const keptQueue = JSON.parse(await readFile(pendingFile, 'utf8'))
   check('a changed log cancels its queued deletion', keptQueue.entries.length === 0, JSON.stringify(keptQueue))
 
+  // ---- a queued entry whose log cannot be located stays queued -------------
+  await writeFile(pendingFile, JSON.stringify({
+    version: 1,
+    entries: [{ sessionId: 's-unlocatable', revision: 'rev-x', queuedAt: '2026-01-01T00:00:00.000Z' }],
+  }), 'utf8')
+  await drainDeferred(restart)
+  const stuck = JSON.parse(await readFile(pendingFile, 'utf8'))
+  check('a queued log that cannot be located is retried later, not dropped', stuck.entries.length === 1
+    && stuck.entries[0].sessionId === 's-unlocatable', JSON.stringify(stuck))
+
   // ---- a batch keeps going past a refusal ----------------------------------
   detached.length = 0
   res = await call(routes, {
@@ -276,13 +320,6 @@ try {
   check('batch continues past a refused Session', batch[1].code === 'session-not-found')
   check('batch removes that log too', await gone(logs.get('s-two').dir))
   check('batch detaches from every accounting workspace', detached.includes('s-two') && detached.includes('two:s-two'))
-
-  // ---- a refused path changes nothing --------------------------------------
-  res = await call(routes, { method: 'POST', contentType: 'application/json', body: '{"sessionIds":["s-bad"]}' })
-  check('a non-directory log path reports delete-failed', res.statusCode === 200
-    && res.json().results[0].code === 'delete-failed', res.body)
-  check('a refused deletion keeps the archive record', archived.has('s-bad'))
-  check('a refused deletion leaves that path alone', !(await gone(notADir)))
 } finally {
   await rm(root, { recursive: true, force: true })
 }

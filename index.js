@@ -42,7 +42,7 @@
 
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 
 /** Cordis function-plugin name. */
 export const name = 'archived-session-delete'
@@ -223,9 +223,19 @@ async function purgeOne({ ctx, registry, persistence, sessions }, sessionId) {
       const kinds = activity.map(entry => entry.kind).join(', ')
       return refuse('session-busy', `session '${sessionId}' is still working (${kinds})`)
     }
-    const revision = typeof snapshot?.revision === 'string' ? snapshot.revision : null
+    if (snapshot === undefined) {
+      // Open but never materialized: there is no log to queue.
+      const warnings = await cleanRecords(ctx, registry, sessionId)
+      return { sessionId, ok: true, logDir: null, warnings }
+    }
+    const revision = typeof snapshot.revision === 'string' ? snapshot.revision : null
     if (revision === null) {
-      return refuse('session-live', `session '${sessionId}' is open in this process and has no stored log to queue`)
+      return refuse('session-live', `session '${sessionId}' is open in this process and reports no log revision to guard the queue`)
+    }
+    // Queueing a log we cannot locate would only drop the entry at the next
+    // start, so the location is proved here too.
+    if (await locateLogDir(sessionId, snapshot, ctx) === null) {
+      return refuse('delete-failed', `cannot locate the stored log of session '${sessionId}', so it cannot be queued`)
     }
     await enqueueDeferred(sessionId, revision)
     const warnings = await cleanRecords(ctx, registry, sessionId)
@@ -235,7 +245,7 @@ async function purgeOne({ ctx, registry, persistence, sessions }, sessionId) {
   // Step 1: the stored log directory. Failing here changes nothing else.
   let logDir = null
   try {
-    logDir = await removeLog(snapshot)
+    logDir = await removeLog(sessionId, snapshot, ctx)
   } catch (failure) {
     return refuse('delete-failed', `cannot delete the stored log of session '${sessionId}': ${messageOf(failure)}`)
   }
@@ -248,19 +258,32 @@ async function purgeOne({ ctx, registry, persistence, sessions }, sessionId) {
 
 /**
  * Remove one Session's stored log directory, proving the removal happened.
+ *
+ * `snapshot === undefined` means the backend holds no artifact for this Session
+ * (a blank Session, or one only the archive set still names): there is nothing
+ * to remove, and that is not a failure. A snapshot that exists but yields no
+ * locatable directory IS a failure — reporting success there is exactly the bug
+ * that let a "delete" turn into an unarchive.
+ *
+ * @param sessionId - the Session whose log to remove.
  * @param snapshot - the backend's snapshot for that Session.
- * @returns the removed directory, or null when the backend named no artifact.
+ * @param ctx - the plugin context (for the locator's logging).
+ * @returns the removed directory, or null when the backend holds no artifact.
+ * @throws when a stored artifact exists but cannot be located or removed.
  */
-async function removeLog(snapshot) {
-  const path = snapshot?.location?.path
-  if (typeof path !== 'string' || path.length === 0) return null
-  const logDir = dirname(path)
-  // The backend's answer is a precondition, not a fact: only a real directory
-  // is removed, so a snapshot naming something else refuses instead of
-  // reporting a deletion that never happened.
+async function removeLog(sessionId, snapshot, ctx) {
+  if (snapshot === undefined) return null
+  const logDir = await locateLogDir(sessionId, snapshot, ctx)
+  if (logDir === null) {
+    throw new Error(
+      `the backend holds a log but named no path, and no session directory matched under ${sessionsRoot()}`,
+    )
+  }
+  // Only a real directory in the sessions tree is removed, so a bad answer
+  // refuses instead of reporting a deletion that never happened.
   const before = await stat(logDir)
   if (!before.isDirectory()) {
-    throw new Error(`the stored log path is not inside a session directory: ${path}`)
+    throw new Error(`the resolved log path is not a session directory: ${logDir}`)
   }
   await rm(logDir, { recursive: true, force: true })
   // `force` also suppresses a path that resolves through a non-directory, so
@@ -269,6 +292,92 @@ async function removeLog(snapshot) {
     throw new Error(`the stored log directory is still there: ${logDir}`)
   }
   return logDir
+}
+
+/**
+ * Resolve the directory that holds one Session's stored log.
+ *
+ * Two sources, in order:
+ *
+ * 1. `snapshot.location.path`, the backend's own answer. Only 0.2.2-alpha and
+ *    later expose it — `0.2.1` releases keep `SessionLocation` on parse errors
+ *    alone — so it cannot be the only route.
+ * 2. The sessions tree: `$DSH_HOME/sessions/<project>/<encoded id>/`, walking
+ *    one project level and accepting only a directory whose name is exactly the
+ *    encoded Session id AND that actually holds a `session*.jsonl*` file.
+ *
+ * @param sessionId - the Session to locate.
+ * @param snapshot - the backend's snapshot for that Session.
+ * @param ctx - the plugin context (for a one-line diagnostic).
+ * @returns the directory, or null when neither source resolves one.
+ */
+async function locateLogDir(sessionId, snapshot, ctx) {
+  const named = snapshot?.location?.path
+  if (typeof named === 'string' && named.length > 0) return dirname(named)
+  const root = sessionsRoot()
+  let projects
+  try {
+    projects = await readdir(root, { withFileTypes: true })
+  } catch (failure) {
+    ctx.logger?.debug?.(`archived-session-delete: cannot list ${root}: ${messageOf(failure)}`)
+    return null
+  }
+  const segment = encodeSegment(sessionId)
+  for (const project of projects) {
+    if (!project.isDirectory()) continue
+    const candidate = join(root, project.name, segment)
+    if (await holdsSessionLog(candidate)) return candidate
+  }
+  return null
+}
+
+/**
+ * Whether a directory holds a stored Session log file.
+ * @param dir - candidate session directory.
+ * @returns true when a `session*.jsonl*` file is inside.
+ */
+async function holdsSessionLog(dir) {
+  try {
+    const entries = await readdir(dir, { withFileTypes: true })
+    return entries.some(entry => entry.isFile()
+      && entry.name.startsWith('session')
+      && entry.name.includes('.jsonl'))
+  } catch {
+    return false
+  }
+}
+
+/**
+ * The persistence backend's path-segment encoding, reproduced so the sessions
+ * tree can be searched without a backend that reports paths.
+ * @param raw - the Session id.
+ * @returns the directory name the backend would use.
+ */
+function encodeSegment(raw) {
+  if (raw.length === 0) throw new Error('cannot encode an empty path segment')
+  if (raw === '.') return '~002E'
+  if (raw === '..') return '~002E~002E'
+  let out = ''
+  for (let index = 0; index < raw.length; index += 1) {
+    const code = raw.charCodeAt(index)
+    const character = String.fromCharCode(code)
+    out += character !== '~' && /^[A-Za-z0-9._-]$/.test(character)
+      ? character
+      : `~${code.toString(16).toUpperCase().padStart(4, '0')}`
+  }
+  return out
+}
+
+/** The Harness home directory, from the environment or the usual default. */
+function harnessHome() {
+  return typeof process.env.DSH_HOME === 'string' && process.env.DSH_HOME !== ''
+    ? process.env.DSH_HOME
+    : join(homedir(), '.dsh')
+}
+
+/** The directory holding every stored Session tree. */
+function sessionsRoot() {
+  return join(harnessHome(), 'sessions')
 }
 
 /**
@@ -301,10 +410,7 @@ async function cleanRecords(ctx, registry, sessionId) {
 
 /** Directory holding this plugin's own state, beside the rest of the Harness home. */
 function stateDir() {
-  const home = typeof process.env.DSH_HOME === 'string' && process.env.DSH_HOME !== ''
-    ? process.env.DSH_HOME
-    : join(homedir(), '.dsh')
-  return join(home, 'archived-session-delete')
+  return join(harnessHome(), 'archived-session-delete')
 }
 
 /** The deferred-deletion queue file. */
@@ -394,7 +500,9 @@ export async function drainDeferred(ctx) {
     // The user kept talking in it after asking to delete it: leave it alone.
     if (snapshot.revision !== revision) continue
     try {
-      await removeLog(snapshot)
+      // A snapshot with no locatable log throws: the entry stays queued rather
+      // than being dropped as "handled" while the log survives on disk.
+      await removeLog(sessionId, snapshot, ctx)
     } catch (failure) {
       ctx.logger?.warn?.(`archived-session-delete: deferred removal of '${sessionId}' failed: ${messageOf(failure)}`)
       keep.push(entry)
